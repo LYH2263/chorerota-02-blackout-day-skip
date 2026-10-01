@@ -9,6 +9,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS assignments(id INTEGER PRIMARY KEY AUTOINCREMENT, week_id INT, day INT, task_id INT, member_id INT);
     CREATE TABLE IF NOT EXISTS swap_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, week_id INT, a_day INT, a_task INT, b_day INT, b_task INT, status TEXT, note TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS member_taboos(member_id INT, day INT, PRIMARY KEY(member_id, day));
+    CREATE TABLE IF NOT EXISTS week_taboos(week_id INT, member_id INT, day INT, PRIMARY KEY(week_id, member_id, day));
     """)
     if c.execute("SELECT COUNT(*) c FROM members").fetchone()["c"] == 0:
         c.executemany("INSERT INTO members(name,active,data_quality) VALUES (?,?,?)", [

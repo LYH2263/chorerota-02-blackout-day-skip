@@ -4,7 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import build_week_slots, swap_legal, apply_swap, AllTabooDayError
+from app.engines.taboos import validate_taboo_days
+from app.engines.swap_gate import swap_taboo_violation
+from app import taboos_store
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -17,7 +20,13 @@ def health(): return {"ok": True, "project": "chorerota"}
 
 @app.get("/api/members")
 def list_members():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM members")]; c.close(); return rows
+    c = connect()
+    rows = [dict(r) for r in c.execute("SELECT * FROM members")]
+    taboos = taboos_store.load_taboos(c)
+    c.close()
+    for r in rows:
+        r["taboo_days"] = sorted(taboos.get(r["id"], ()))
+    return rows
 
 @app.post("/api/members")
 def add_member(body: dict):
@@ -25,6 +34,22 @@ def add_member(body: dict):
     cur = c.execute("INSERT INTO members(name,active,data_quality) VALUES (?,?,?)",
                     (body.get("name","未命名"), int(body.get("active",1)), body.get("data_quality","clean")))
     c.commit(); mid = cur.lastrowid; c.close(); return {"id": mid}
+
+class TabooBody(BaseModel):
+    days: list[int] = []
+
+@app.put("/api/members/{member_id}/taboos")
+def put_member_taboos(member_id: int, body: TabooBody):
+    c = connect()
+    m = c.execute("SELECT id FROM members WHERE id=?", (member_id,)).fetchone()
+    if not m: c.close(); raise HTTPException(404, "member not found")
+    try:
+        days = validate_taboo_days(body.days)
+    except ValueError as e:
+        c.close(); raise HTTPException(400, str(e))
+    taboos_store.replace_member_taboos(c, member_id, days)
+    c.commit(); c.close()
+    return {"id": member_id, "taboo_days": days}
 
 @app.get("/api/tasks")
 def list_tasks():
@@ -49,11 +74,14 @@ def week_board(week_id: int):
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    snap = taboos_store.load_week_taboos(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    taboos = [{"member_id": mid, "name": members.get(mid, "?"), "days": days}
+              for mid, days in sorted(snap.items())]
+    return {"week": dict(week), "assignments": assigns, "taboos": taboos}
 
 class GenBody(BaseModel):
     days: int = 7
@@ -65,14 +93,21 @@ def generate(week_id: int, body: GenBody = GenBody()):
     if not week: c.close(); raise HTTPException(404, "week not found")
     mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
     tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
+    taboos = {m: d for m, d in taboos_store.load_taboos(c).items() if m in mids and d}
+    try:
+        slots = build_week_slots(mids, tids, days=body.days, taboos=taboos)
+    except AllTabooDayError as e:
+        # 取舍: 整次生成失败并保持原格 — nothing is written, board keeps old grid.
+        c.close(); raise HTTPException(400, f"all_taboo_day:{e.day}")
     c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
     for s in slots:
         c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
                   (week_id, s["day"], s["task_id"], s["member_id"]))
+    taboos_store.snapshot_week_taboos(c, week_id, taboos)
     c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
     c.commit(); c.close()
-    return {"count": len(slots), "slots": slots}
+    return {"count": len(slots), "slots": slots,
+            "taboos": {str(m): sorted(d) for m, d in taboos.items()}}
 
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
@@ -84,6 +119,10 @@ def request_swap(week_id: int, body: SwapBody):
     check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task)
     if not check["ok"]:
         c.close(); raise HTTPException(400, check["reason"])
+    gate = swap_taboo_violation(assigns, body.a_day, body.a_task, body.b_day, body.b_task,
+                                taboos_store.load_taboos(c))
+    if not gate["ok"]:
+        c.close(); raise HTTPException(400, gate["reason"])
     cur = c.execute(
         "INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,status,note) VALUES (?,?,?,?,?,?,?)",
         (week_id, body.a_day, body.a_task, body.b_day, body.b_task, "pending", body.note))
@@ -104,6 +143,11 @@ def confirm_swap(swap_id: int):
     assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
+    gate = swap_taboo_violation(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"],
+                                taboos_store.load_taboos(c))
+    if not gate["ok"]:
+        # 现行忌日收紧后，旧申请确认时同样拒改表
+        c.close(); raise HTTPException(400, gate["reason"])
     try:
         new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
     except ValueError as e:
