@@ -1,14 +1,43 @@
 """Round-robin weekly chore assignments + swap legality."""
 
-def build_week_slots(member_ids: list[int], task_ids: list[int], days: int = 7) -> list[dict]:
-    """Assign each (day, task) to members in round-robin by task then day."""
+
+class AllMembersUnavailableError(Exception):
+    """某 day 全部活跃 clean 成员均忌日，整次生成必须放弃。"""
+
+    def __init__(self, day: int):
+        super().__init__("all_unavailable")
+        self.day = day
+        self.reason = "all_unavailable"
+
+
+def build_week_slots(
+    member_ids: list[int],
+    task_ids: list[int],
+    days: int = 7,
+    unavailable: dict | None = None,
+) -> list[dict]:
+    """按 task→day 顺序 round-robin 落位。
+
+    unavailable: {member_id: set(day)}，命中忌日的成员不得出现在该 day
+    的任何格子；指针相位继续前进，改由其后第一位可用的活跃成员承接。
+    无忌日时格位与原 round-robin 完全一致。
+    某 day 全员忌日抛 AllMembersUnavailableError（不产生部分结果）。
+    """
     if not member_ids or not task_ids:
         return []
+    blocked = {mid: set(ds) for mid, ds in (unavailable or {}).items() if ds}
+    n = len(member_ids)
     slots = []
     idx = 0
     for day in range(days):
         for tid in task_ids:
-            mid = member_ids[idx % len(member_ids)]
+            tried = 0
+            while day in blocked.get(member_ids[idx % n], ()):
+                idx += 1
+                tried += 1
+                if tried >= n:
+                    raise AllMembersUnavailableError(day)
+            mid = member_ids[idx % n]
             slots.append({"day": day, "task_id": tid, "member_id": mid})
             idx += 1
     return slots

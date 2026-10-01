@@ -49,3 +49,20 @@ input, select, textarea {
 .list { padding: 0; margin: 0; }
 .muted { color: var(--muted); font-size: 13px; }
 .err { color: #b33a2c; }
+.ok { color: #2f7d3f; font-size: 12px; margin-left: 6px; }
+
+/* 忌日 */
+.memorial-row { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.day-toggle {
+  padding: 3px 8px; border-radius: 8px; font-size: 12px;
+  background: #fff; color: var(--ink); border: 1px solid var(--line);
+}
+.day-toggle.on { background: #d9c7b8; color: #5a3b26; border-color: #b89a82; }
+.chip.memorial { background: #efe4d6; color: #6b4a2e; }
+.pinned { margin-top: 6px; }
+.memorial-mark {
+  font-size: 11px; color: #6b4a2e; background: #efe4d6;
+  border-radius: 6px; padding: 1px 6px; margin-left: 6px;
+}
+.memorial-banner { margin-bottom: 12px; }
+.memorial-banner header { color: #6b4a2e; }

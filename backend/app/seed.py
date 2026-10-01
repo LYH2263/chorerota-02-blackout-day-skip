@@ -1,5 +1,8 @@
 from app.db import connect
 
+def _has_column(c, table: str, column: str) -> bool:
+    return any(r["name"] == column for r in c.execute(f"PRAGMA table_info({table})"))
+
 def init_db():
     c = connect()
     c.executescript("""
@@ -10,6 +13,11 @@ def init_db():
     CREATE TABLE IF NOT EXISTS swap_requests(id INTEGER PRIMARY KEY AUTOINCREMENT, week_id INT, a_day INT, a_task INT, b_day INT, b_task INT, status TEXT, note TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     """)
+    # 忌日：members 存现行集合（JSON），weeks 存生成当周快照（JSON）
+    if not _has_column(c, "members", "memorial_days"):
+        c.execute("ALTER TABLE members ADD COLUMN memorial_days TEXT")
+    if not _has_column(c, "weeks", "memorial_snapshot"):
+        c.execute("ALTER TABLE weeks ADD COLUMN memorial_snapshot TEXT")
     if c.execute("SELECT COUNT(*) c FROM members").fetchone()["c"] == 0:
         c.executemany("INSERT INTO members(name,active,data_quality) VALUES (?,?,?)", [
             ("阿明", 1, "clean"), ("小雨", 1, "clean"), ("爷爷", 1, "clean"),

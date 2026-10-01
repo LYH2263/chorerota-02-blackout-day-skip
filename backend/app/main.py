@@ -4,7 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import build_week_slots, AllMembersUnavailableError
+from app.engines.swap_gate import swap_legal, apply_swap
+from app.modules.memorial import store as memorial_store
+from app.modules.memorial.validation import MemorialDayError, normalize_days
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -17,7 +20,34 @@ def health(): return {"ok": True, "project": "chorerota"}
 
 @app.get("/api/members")
 def list_members():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM members")]; c.close(); return rows
+    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM members")]; c.close()
+    for r in rows:
+        raw = r.get("memorial_days")
+        try:
+            r["memorial_days"] = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            r["memorial_days"] = []
+    return rows
+
+class MemorialBody(BaseModel):
+    days: list = []
+
+@app.put("/api/members/{member_id}/memorial")
+def put_member_memorial(member_id: int, body: MemorialBody):
+    # 先校验后写：越界/非整数 400 且不改成员档
+    try:
+        normalize_days(body.days)
+    except MemorialDayError as e:
+        raise HTTPException(400, str(e))
+    c = connect()
+    try:
+        norm = memorial_store.set_member_memorial(c, member_id, body.days)
+    except MemorialDayError as e:
+        c.rollback(); c.close(); raise HTTPException(400, str(e))
+    except LookupError:
+        c.close(); raise HTTPException(404, "member not found")
+    c.commit(); c.close()
+    return {"id": member_id, "memorial_days": norm}
 
 @app.post("/api/members")
 def add_member(body: dict):
@@ -49,11 +79,12 @@ def week_board(week_id: int):
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    snapshot = memorial_store.week_snapshot_json(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    return {"week": dict(week), "assignments": assigns, "memorial_snapshot": snapshot}
 
 class GenBody(BaseModel):
     days: int = 7
@@ -65,14 +96,18 @@ def generate(week_id: int, body: GenBody = GenBody()):
     if not week: c.close(); raise HTTPException(404, "week not found")
     mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
     tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
-    c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
-    for s in slots:
-        c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
-                  (week_id, s["day"], s["task_id"], s["member_id"]))
+    # 生成时把现行忌日集合快照钉进本周；全员忌日则整次失败、保持原格
+    snapshot = memorial_store.build_snapshot(c, mids)
+    unavailable = {int(mid): set(days) for mid, days in snapshot.items()}
+    try:
+        slots = build_week_slots(mids, tids, days=body.days, unavailable=unavailable)
+    except AllMembersUnavailableError as e:
+        c.rollback(); c.close(); raise HTTPException(400, e.reason)
+    memorial_store.replace_week_assignments(c, week_id, slots)
+    memorial_store.save_week_snapshot(c, week_id, snapshot)
     c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
     c.commit(); c.close()
-    return {"count": len(slots), "slots": slots}
+    return {"count": len(slots), "slots": slots, "memorial_snapshot": snapshot}
 
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
@@ -81,7 +116,9 @@ class SwapBody(BaseModel):
 def request_swap(week_id: int, body: SwapBody):
     c = connect()
     assigns = [dict(r) for r in c.execute("SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (week_id,))]
-    check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task)
+    # 门禁按现行忌日，不按当周快照：现行收紧后老格也不得对调入忌日格
+    unavailable = memorial_store.current_memorial(c)
+    check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task, unavailable)
     if not check["ok"]:
         c.close(); raise HTTPException(400, check["reason"])
     cur = c.execute(
@@ -104,8 +141,10 @@ def confirm_swap(swap_id: int):
     assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
+    # 确认时再次按现行忌日门禁：忌日收紧后老申请确认也须失败、不改表
+    unavailable = memorial_store.current_memorial(c)
     try:
-        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
+        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"], unavailable)
     except ValueError as e:
         c.close(); raise HTTPException(400, str(e))
     for a, s in zip(assigns, new_slots):

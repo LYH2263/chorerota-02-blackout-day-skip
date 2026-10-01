@@ -25,18 +25,24 @@ import { api } from '../api'
 const rows = ref([])
 const err = ref('')
 const form = ref({ a_day: 0, a_task: 1, b_day: 1, b_task: 1 })
+function friendlyError(code) {
+  if (code === 'memorial_blocked') return '对调会把成员派进其现行忌日格，已拒绝且未改表。'
+  if (code === 'same_assignee') return '两格本就是同一人，无需对调。'
+  if (code === 'slot_missing') return '格位不存在。'
+  return code
+}
 async function load() { rows.value = await api('/swaps') }
 async function request() {
   err.value = ''
   try {
     await api('/weeks/1/swaps', { method: 'POST', body: JSON.stringify(form.value) })
     await load()
-  } catch (e) { err.value = e.message }
+  } catch (e) { err.value = friendlyError(e.message) }
 }
 async function confirm(id) {
   err.value = ''
   try { await api('/swaps/' + id + '/confirm', { method: 'POST', body: '{}' }); await load() }
-  catch (e) { err.value = e.message }
+  catch (e) { err.value = friendlyError(e.message) }
 }
 onMounted(load)
 </script>
